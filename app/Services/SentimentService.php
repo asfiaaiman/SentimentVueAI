@@ -20,16 +20,31 @@ class SentimentService
             return $cached;
         }
 
-        $response = Http::timeout((int) config('ml.timeout'))
-            ->post(rtrim((string) config('ml.server_url'), '/') . '/analyze', [
-                'text' => $normalized,
-            ]);
+        try {
+            $response = Http::retry(3, 200)
+                ->timeout((int) config('ml.timeout'))
+                ->post(rtrim((string) config('ml.server_url'), '/') . '/analyze', [
+                    'text' => $normalized,
+                ]);
 
-        if ($response->failed()) {
-            $response->throw();
+            if ($response->failed()) {
+                return [
+                    'label' => 'unknown',
+                    'confidence' => 0.0,
+                    'message' => 'Sentiment service is temporarily unavailable. Please try again later.',
+                ];
+            }
+
+            $data = $response->json();
+        } catch (\Throwable $e) {
+            // Connection error
+            report($e);
+            return [
+                'label' => 'unknown',
+                'confidence' => 0.0,
+                'message' => 'Could not reach the sentiment service. Please try again shortly.',
+            ];
         }
-
-        $data = $response->json();
 
         $result = [
             'label' => $data['label'] ?? 'unknown',
@@ -75,37 +90,63 @@ class SentimentService
 
         $fetched = [];
         if (!empty($misses)) {
-            $response = Http::timeout($timeout)
-                ->post(rtrim((string) config('ml.server_url'), '/') . '/batch', [
-                    'texts' => array_values($misses),
-                ]);
+            try {
+                $response = Http::retry(3, 200)
+                    ->timeout($timeout)
+                    ->post(rtrim((string) config('ml.server_url'), '/') . '/batch', [
+                        'texts' => array_values($misses),
+                    ]);
 
-            if ($response->failed()) {
-                $response->throw();
-            }
-
-            $data = $response->json();
-            $items = $data['items'] ?? [];
-            // Map back by text value; if duplicates exist, assign sequentially
-            $textToQueue = [];
-            foreach ($items as $item) {
-                $textToQueue[$item['text']][] = $item;
-            }
-            foreach ($misses as $idx => $t) {
-                $queue = $textToQueue[$t] ?? [];
-                $item = array_shift($queue) ?? ['label' => 'unknown', 'confidence' => 0.0, 'text' => $t];
-                $textToQueue[$t] = $queue;
-                $result = [
-                    'label' => $item['label'] ?? 'unknown',
-                    'confidence' => (float) ($item['confidence'] ?? 0.0),
-                ];
-                $full = array_merge($result, [
-                    'text' => $t,
-                    'emotion_label' => $item['emotion_label'] ?? null,
-                    'emotion_confidence' => isset($item['emotion_confidence']) ? (float) $item['emotion_confidence'] : null,
-                ]);
-                $fetched[$idx] = $full;
-                cache()->put('ml:sentiment:' . md5(Str::lower($t)), $result, now()->addSeconds($ttl));
+                if ($response->failed()) {
+                    // Build unknowns for all misses
+                    foreach ($misses as $idx => $t) {
+                        $fetched[$idx] = [
+                            'text' => $t,
+                            'label' => 'unknown',
+                            'confidence' => 0.0,
+                            'emotion_label' => null,
+                            'emotion_confidence' => null,
+                            'message' => 'Sentiment service is temporarily unavailable. Please try again later.',
+                        ];
+                    }
+                } else {
+                    $data = $response->json();
+                    $items = $data['items'] ?? [];
+                    // Map back by text value; if duplicates exist, assign sequentially
+                    $textToQueue = [];
+                    foreach ($items as $item) {
+                        $textToQueue[$item['text']][] = $item;
+                    }
+                    foreach ($misses as $idx => $t) {
+                        $queue = $textToQueue[$t] ?? [];
+                        $item = array_shift($queue) ?? ['label' => 'unknown', 'confidence' => 0.0, 'text' => $t];
+                        $textToQueue[$t] = $queue;
+                        $result = [
+                            'label' => $item['label'] ?? 'unknown',
+                            'confidence' => (float) ($item['confidence'] ?? 0.0),
+                        ];
+                        $full = array_merge($result, [
+                            'text' => $t,
+                            'emotion_label' => $item['emotion_label'] ?? null,
+                            'emotion_confidence' => isset($item['emotion_confidence']) ? (float) $item['emotion_confidence'] : null,
+                        ]);
+                        $fetched[$idx] = $full;
+                        cache()->put('ml:sentiment:' . md5(Str::lower($t)), $result, now()->addSeconds($ttl));
+                    }
+                }
+            } catch (\Throwable $e) {
+                report($e);
+                // On connection error, respond gracefully with unknowns
+                foreach ($misses as $idx => $t) {
+                    $fetched[$idx] = [
+                        'text' => $t,
+                        'label' => 'unknown',
+                        'confidence' => 0.0,
+                        'emotion_label' => null,
+                        'emotion_confidence' => null,
+                        'message' => 'Could not reach the sentiment service. Please try again shortly.',
+                    ];
+                }
             }
         }
 
